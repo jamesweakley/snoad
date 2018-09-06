@@ -1,6 +1,8 @@
 # snoad (beta)
 
-A Powershell script which replicates users and groups from Active Directory into Snowflake
+A Powershell script which replicates users and groups from Active Directory into Snowflake.
+
+This script has not spent much time in production, so it is recommended to use the -WhatIf parameter initially until you are comfortable with how it works. The WhatIf parameter will output the SQL script to the console without executing it.
 
 ## Script Behaviour
 Using an Active Directory Organisational Unit (OU) as a source, the script retrieves all security groups within that OU, along with all users (including those within nested groups). For this reason, the script 

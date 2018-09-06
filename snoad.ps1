@@ -46,10 +46,10 @@ The Active Directory user attribute to use as the Snowflake login name, defaults
 
 .PARAMETER createAnyMissingUsers
 
-When set to $true, if any Active Directory users listed under the AD security groups do
+When set to $true (the default), if any Active Directory users listed under the AD security groups do
 not exist in Snowflake, they will be automatically created.
 
-When set to $false (the default), all relevant users must be created in Snowflake prior to running 
+When set to $false, all relevant users must be created in Snowflake prior to running 
 this script .
 
 .PARAMETER disableRemovedUsers
@@ -78,9 +78,10 @@ param(
     [String][ValidateNotNullOrEmpty()]$snowflakeRegion='ap-southeast-2',
     [String][ValidateNotNullOrEmpty()]$ouIdentity='OU=AsiaPacific,OU=Sales,OU=UserAccounts,DC=FABRIKAM,DC=COM',
     [String]$loginNameADAttribute='mail',
-    [Boolean]$createAnyMissingUsers=$false,
+    [Boolean]$createAnyMissingUsers=$true,
     [Boolean]$disableRemovedUsers=$false,
-    [String]$rolePrefixToRemove='')
+    [String]$rolePrefixToRemove='',
+    [switch]$WhatIf)
 
 $ErrorActionPreference = 'Stop'
 $sqlStatement=""
@@ -182,11 +183,13 @@ $roleMappings.Keys | % {
   }
 }
 
-
 if ($sqlStatement.Length -gt 0){
   $sqlStatement = "BEGIN TRANSACTION;`r`n{0}COMMIT;" -f $sqlStatement
-  write-verbose "Executing SQL statement:`r`n $sqlStatement"
-  snowsql -a $snowflakeAccount -u $snowflakeUser -r $snowflakeRole --region $snowflakeRegion -q $sqlStatement -o exit_on_error=true -o output_format=csv -o timing=false -o log_level=DEBUG
+  If ($WhatIf){
+    write-host "Without the -WhatIf flag, the script will execute the following SQL Statement: `r`n`r`n$sqlStatement"
+  }else{
+    snowsql -a $snowflakeAccount -u $snowflakeUser -r $snowflakeRole --region $snowflakeRegion -q $sqlStatement -o exit_on_error=true -o output_format=csv -o timing=false -o log_level=DEBUG
+  }
 }else{
   write-host "No changes required"
 }
