@@ -72,10 +72,10 @@ Does not incur compute costs as user account administration does not run in a wa
 
 #>
 param(
-    [String][ValidateNotNullOrEmpty()]$snowflakeAccount=${snow_account},
-    [String][ValidateNotNullOrEmpty()]$snowflakeUser=${snow_username},
-    [String][ValidateNotNullOrEmpty()]$snowflakeRole=${snow_userrole},
-    [String][ValidateNotNullOrEmpty()]$snowflakeRegion=${snow_region},
+    [String][ValidateNotNullOrEmpty()]$snowflakeAccount,
+    [String][ValidateNotNullOrEmpty()]$snowflakeUser,
+    [String][ValidateNotNullOrEmpty()]$snowflakeRole,
+    [String][ValidateNotNullOrEmpty()]$snowflakeRegion='ap-southeast-2',
     [String][ValidateNotNullOrEmpty()]$ouIdentity='OU=AsiaPacific,OU=Sales,OU=UserAccounts,DC=FABRIKAM,DC=COM',
     [String]$loginNameADAttribute='mail',
     [Boolean]$createAnyMissingUsers=$false,
