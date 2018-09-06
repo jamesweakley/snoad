@@ -1,4 +1,4 @@
-# snoad
+# snoad (beta)
 
 A Powershell script which replicates users and groups from Active Directory into Snowflake
 
@@ -24,6 +24,8 @@ If disableRemovedUsers is set to $true, any SSO-based Snowflake users (i.e. thos
 You must have snowsql installed and on your path prior to running this function.
 
 Does not incur compute costs as user account administration does not run in a warehouse.
+
+**This is a community-developed script, not an official Snowflake offering. It comes with no support.**
 
 ## License
 
