@@ -114,6 +114,7 @@ write-host "Retrieving list of current snowflake users"
 $currentSnowflakeUsers = snowsql -a $snowflakeAccount -u $snowflakeUser -r $snowflakeRole --region $snowflakeRegion -q 'show users' -o exit_on_error=true -o output_format=csv -o friendly=false -o timing=false | convertfrom-csv
 # Only include those without passwords (SSO users)
 $currentSnowflakeUserNames = $currentSnowflakeUsers | where-object {$_.has_password -eq 'false'} | %{$_.name}
+write-host "Total current Snowflake SSO users:  $($currentSnowflakeUserNames.Length)"
 
 write-host "Retrieving AD security groups in OU $ouIdentity"
 $roleMappings=@{}
@@ -124,16 +125,12 @@ if ($rolePrefix -ne $null){
 }
 $groupsMatchingRolePrefix | % {
   $roleName = $_.Name
-  if ($removeRolePrefix){
-    $roleNameNew = $roleName -replace "^$rolePrefix",""
-    write-host "Removing role prefix from $roleName, yielding $roleNameNew"
-    $roleName = $roleNameNew
-  }
   write-host "Fetching users in group $roleName whose accounts aren't disabled"
   $roleMappings[$roleName] = $_ | Get-ADGroupMember -Recursive | select samaccountname | %{(Get-ADUser $_.samaccountname -Properties $loginNameADAttribute,Enabled | where-object {$_.($loginNameADAttribute) -ne $null -and $_.Enabled -eq $true}).($loginNameADAttribute)}
 }
 
 $allUsersInRoleMappings=$roleMappings.Keys |% {$roleMappings[$_]} | Select-Object -Unique | sort
+write-host "Total users defined in AD roles: $($allUsersInRoleMappings.Length)"
 
 $missingSnowflakeUsers=$allUsersInRoleMappings | Where-Object {$_ -notin $currentSnowflakeUserNames}
 $superfluousSnowflakeUsers=$currentSnowflakeUserNames | Where-Object {$_ -notin $allUsersInRoleMappings}
@@ -195,6 +192,12 @@ REVOKE ROLE \"{0}\" FROM USER \"{1}\";`r`n
 # ensure that all users, roles and grants defined in AD exist in snowflake
 $roleMappings.Keys | % {
   $roleName = $_
+
+  if ($removeRolePrefix){
+    $roleNameNew = $roleName -replace "^$rolePrefix",""
+    write-host "Removing role prefix from $roleName, yielding $roleNameNew"
+    $roleName = $roleNameNew
+  }
   write-host "Checking role $roleName exists in Snowflake"
   if (($currentSnowflakeRoles | Where-Object {$_.name -eq $roleName}) -eq $null){
     write-host "Role does not exist, creating"
