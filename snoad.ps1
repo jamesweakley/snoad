@@ -60,6 +60,20 @@ groups will be disabled in Snowflake.
 When set to $false (the default), they will be left alone (though they will still be revoked from all 
 AD-based Snowflake roles)
 
+.PARAMETER rolePrefix
+
+If specified, includes only security groups within the OU that begin with this string
+
+.PARAMETER removeRolePrefix
+
+If set to true, removes the value specified in rolePrefix from the beginning of the string. 
+For example, if specifed a rolePrefix of 'snowflake-role-' and also set this parameter to $true, 
+an AD group named 'snowflake-role-analyst' becomes the snowflake role 'analyst'.
+
+.PARAMETER WhatIf
+
+A testing/trust-building parameter. If specified, only outputs the SQL script to the terminal and doesn't run it.
+
 .EXAMPLE
 
 .\snoad.ps1 -snowflakeAccount 'ly12345' -snowflakeUser 'usersync' -snowflakeRole 'ACCOUNTADMIN' -snowflakeRegion 'ap-southeast-2' -ouIdentity 'OU=AsiaPacific,OU=Sales,OU=UserAccounts,DC=FABRIKAM,DC=COM' -createAnyMissingUsers $true
@@ -70,17 +84,20 @@ You must have snowsql installed and on your path prior to running this function.
 
 Does not incur compute costs as user account administration does not run in a warehouse.
 
+You must provide the Snowflake password in the environment variable SNOWSQL_PWD.
+
 #>
 param(
-    [String][ValidateNotNullOrEmpty()]$snowflakeAccount,
+    [String][ValidateNotNullOrEmpty()]$snowflakeAccount='ap-southeast-2',
     [String][ValidateNotNullOrEmpty()]$snowflakeUser,
     [String][ValidateNotNullOrEmpty()]$snowflakeRole,
-    [String][ValidateNotNullOrEmpty()]$snowflakeRegion='ap-southeast-2',
-    [String][ValidateNotNullOrEmpty()]$ouIdentity='OU=AsiaPacific,OU=Sales,OU=UserAccounts,DC=FABRIKAM,DC=COM',
+    [String][ValidateNotNullOrEmpty()]$snowflakeRegion,
+    [String][ValidateNotNullOrEmpty()]$ouIdentity,
     [String]$loginNameADAttribute='mail',
-    [Boolean]$createAnyMissingUsers=$true,
-    [Boolean]$disableRemovedUsers=$false,
-    [String]$rolePrefixToRemove='',
+    [Boolean]$createAnyMissingUsers=$True,
+    [Boolean]$disableRemovedUsers=$True,
+    [String]$rolePrefix,
+    [Boolean]$removeRolePrefix=$False,
     [switch]$WhatIf)
 
 $ErrorActionPreference = 'Stop'
@@ -89,6 +106,10 @@ $sqlStatement=""
 write-host 'Importing Active Directory module'
 Import-Module ActiveDirectory
 
+if ($env:SNOWSQL_PWD -eq $null){
+    throw "SNOWSQL_PWD environment variable not defined"
+}
+
 write-host "Retrieving list of current snowflake users"
 $currentSnowflakeUsers = snowsql -a $snowflakeAccount -u $snowflakeUser -r $snowflakeRole --region $snowflakeRegion -q 'show users' -o exit_on_error=true -o output_format=csv -o friendly=false -o timing=false | convertfrom-csv
 # Only include those without passwords (SSO users)
@@ -96,9 +117,19 @@ $currentSnowflakeUserNames = $currentSnowflakeUsers | where-object {$_.has_passw
 
 write-host "Retrieving AD security groups in OU $ouIdentity"
 $roleMappings=@{}
-Get-ADGroup -SearchBase $ouIdentity -filter {GroupCategory -eq "Security"} | % {
-  $roleName = $_.Name -replace "^$rolePrefixToRemove",""
-  write-host "Fetching users in group $($_.Name) whose accounts aren't disabled"
+$allGroups=Get-ADGroup -SearchBase $ouIdentity -filter {GroupCategory -eq "Security"}
+$groupsMatchingRolePrefix = $allGroups
+if ($rolePrefix -ne $null){
+  $groupsMatchingRolePrefix = $allGroups | Where-Object {$_.Name.StartsWith($rolePrefix)}
+}
+$groupsMatchingRolePrefix | % {
+  $roleName = $_.Name
+  if ($removeRolePrefix){
+    $roleNameNew = $roleName -replace "^$rolePrefix",""
+    write-host "Removing role prefix from $roleName, yielding $roleNameNew"
+    $roleName = $roleNameNew
+  }
+  write-host "Fetching users in group $roleName whose accounts aren't disabled"
   $roleMappings[$roleName] = $_ | Get-ADGroupMember -Recursive | select samaccountname | %{(Get-ADUser $_.samaccountname -Properties $loginNameADAttribute,Enabled | where-object {$_.($loginNameADAttribute) -ne $null -and $_.Enabled -eq $true}).($loginNameADAttribute)}
 }
 
@@ -173,8 +204,8 @@ $roleMappings.Keys | % {
   $currentRoleGrantees = $currentSnowflakeRoleGrants | Where-Object {$_.role -eq $roleName -and $_.grantee_name -like '*@*'} | %{$_.grantee_name}
   $missingSnowflakeGrantees = $roleMappings[$roleName] | Where-Object {$_ -ne $null -and $_ -notin $currentRoleGrantees}
   $superfluousSnowflakeGrantees = $currentRoleGrantees | Where-Object {$_ -ne $null -and $_ -notin $roleMappings[$roleName]}
-  write-verbose "Missing grantees: $missingSnowflakeGrantees"
-  write-verbose "Superfluous grantees: $superfluousSnowflakeGrantees"
+  write-host "Missing grantees: $missingSnowflakeGrantees"
+  write-host "Superfluous grantees: $superfluousSnowflakeGrantees"
   $missingSnowflakeGrantees | %{
     $sqlStatement = $sqlStatement + ($grantRoleSqlTemplate -f $roleName,$_)
   }
@@ -183,11 +214,13 @@ $roleMappings.Keys | % {
   }
 }
 
+
 if ($sqlStatement.Length -gt 0){
   $sqlStatement = "BEGIN TRANSACTION;`r`n{0}COMMIT;" -f $sqlStatement
   If ($WhatIf){
     write-host "Without the -WhatIf flag, the script will execute the following SQL Statement: `r`n`r`n$sqlStatement"
   }else{
+    write-host "Executing SQL statement:`r`n $sqlStatement"
     snowsql -a $snowflakeAccount -u $snowflakeUser -r $snowflakeRole --region $snowflakeRegion -q $sqlStatement -o exit_on_error=true -o output_format=csv -o timing=false -o log_level=DEBUG
   }
 }else{
