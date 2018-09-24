@@ -80,6 +80,8 @@ A testing/trust-building parameter. If specified, only outputs the SQL script to
 
 .NOTES
 
+IMPORTANT! The script makes the assumption that AD users do not have Snowflake passwords, and the rest do. This is how it determines which accounts to sync up and which to ignore.
+
 You must have snowsql installed and on your path prior to running this function.
 
 Does not incur compute costs as user account administration does not run in a warehouse.
@@ -109,13 +111,20 @@ Import-Module ActiveDirectory
 if ($env:SNOWSQL_PWD -eq $null){
     throw "SNOWSQL_PWD environment variable not defined"
 }
-
+# -------------------------------------------------------------------------------------
+# Retrieve current users from Snowflake
+# -------------------------------------------------------------------------------------
 write-host "Retrieving list of current snowflake users"
 $currentSnowflakeUsers = snowsql -a $snowflakeAccount -u $snowflakeUser -r $snowflakeRole --region $snowflakeRegion -q 'show users' -o exit_on_error=true -o output_format=csv -o friendly=false -o timing=false | convertfrom-csv
 # Only include those without passwords (SSO users)
-$currentSnowflakeUserNames = $currentSnowflakeUsers | where-object {$_.has_password -eq 'false'} | %{$_.name}
-write-host "Total current Snowflake SSO users:  $($currentSnowflakeUserNames.Length)"
+$currentSnowflakeNonSSOUserNames = @($currentSnowflakeUsers | where-object {$_.has_password -eq 'true'} | %{$_.name})
+$currentSnowflakeEnabledSSOUserNames = @($currentSnowflakeUsers | where-object {$_.has_password -eq 'false' -and $_.disabled -eq 'false'} | %{$_.name})
+$currentSnowflakeDisabledSSOUserNames = @($currentSnowflakeUsers | where-object {$_.has_password -eq 'false' -and $_.disabled -eq 'true'} | %{$_.name})
+write-host "Total current Snowflake SSO users:  $($currentSnowflakeEnabledSSOUserNames.Length)"
 
+# -------------------------------------------------------------------------------------
+# Retrieve security groups from AD
+# -------------------------------------------------------------------------------------
 write-host "Retrieving AD security groups in OU $ouIdentity"
 $roleMappings=@{}
 $allGroups=Get-ADGroup -SearchBase $ouIdentity -filter {GroupCategory -eq "Security"}
@@ -123,34 +132,58 @@ $groupsMatchingRolePrefix = $allGroups
 if ($rolePrefix -ne $null){
   $groupsMatchingRolePrefix = $allGroups | Where-Object {$_.Name.StartsWith($rolePrefix)}
 }
+# -------------------------------------------------------------------------------------
+# Get a full list of AD users in each group, and strip off the prefix if configured
+# -------------------------------------------------------------------------------------
 $groupsMatchingRolePrefix | % {
   $roleName = $_.Name
-  write-host "Fetching users in group $roleName whose accounts aren't disabled"
+  if ($removeRolePrefix){
+    $roleNameNew = $roleName -replace "^$rolePrefix",""
+    write-host "Removing role prefix from $roleName, yielding $roleNameNew"
+    $roleName = $roleNameNew
+  }
+  write-host "Fetching users in group $($_.Name) whose accounts aren't disabled"
   $roleMappings[$roleName] = $_ | Get-ADGroupMember -Recursive | select samaccountname | %{(Get-ADUser $_.samaccountname -Properties $loginNameADAttribute,Enabled | where-object {$_.($loginNameADAttribute) -ne $null -and $_.Enabled -eq $true}).($loginNameADAttribute)}
 }
 
-$allUsersInRoleMappings=$roleMappings.Keys |% {$roleMappings[$_]} | Select-Object -Unique | sort
+# -------------------------------------------------------------------------------------
+# Work out which users require creating and which require disabling
+# -------------------------------------------------------------------------------------
+$allUsersInRoleMappings=@($roleMappings.Keys |% {$roleMappings[$_]} | Select-Object -Unique | sort)
 write-host "Total users defined in AD roles: $($allUsersInRoleMappings.Length)"
 
-$missingSnowflakeUsers=$allUsersInRoleMappings | Where-Object {$_ -notin $currentSnowflakeUserNames}
-$superfluousSnowflakeUsers=$currentSnowflakeUserNames | Where-Object {$_ -notin $allUsersInRoleMappings}
+$missingSnowflakeUsers=@($allUsersInRoleMappings | Where-Object {$_ -notin $currentSnowflakeEnabledSSOUserNames})
+$superfluousSnowflakeUsers=@($currentSnowflakeEnabledSSOUserNames | Where-Object {$_ -notin $allUsersInRoleMappings})
 
+# -------------------------------------------------------------------------------------
+# Add missing users to Snowflake, or re-enabled them if they are disabled
+# -------------------------------------------------------------------------------------
 $addUserSqlTemplate=@"
 CREATE USER \"{0}\" LOGIN_NAME=\"{0}\" MUST_CHANGE_PASSWORD=FALSE;`r`n
+"@
+$enableUserSqlTemplate=@"
+ALTER USER \"{0}\" SET DISABLED=FALSE;`r`n
 "@
 
 if ($missingSnowflakeUsers.Length -gt 0){
   if ($createAnyMissingUsers){
-    write-host "Adding $($missingSnowflakeUsers.Length) missing users"
+    write-host "Adding/enabling $($missingSnowflakeUsers.Length) missing users"
     $addUserSql=""
     $missingSnowflakeUsers | %{
-      $sqlStatement = $sqlStatement + ($addUserSqlTemplate -f $_)
+      if ($_ -in $currentSnowflakeDisabledSSOUserNames){
+        $sqlStatement = $sqlStatement + ($enableUserSqlTemplate -f $_)
+      }else{
+        $sqlStatement = $sqlStatement + ($addUserSqlTemplate -f $_)
+      }
     }
   }else{
     throw "The following users are missing from Snowflake: $missingSnowflakeUsers"
   }
 }
 
+# -------------------------------------------------------------------------------------
+# Disable Snowflake users who are no longer in any AD groups
+# -------------------------------------------------------------------------------------
 $disableUserSqlTemplate=@"
 ALTER USER \"{0}\" SET DISABLED=TRUE;`r`n
 "@
@@ -162,11 +195,13 @@ if ($superfluousSnowflakeUsers.Length -gt 0 -and $disableRemovedUsers){
   }
 }
 
+# -------------------------------------------------------------------------------------
+# Retrieve all Snowflake roles, and which users are granted to each
+# -------------------------------------------------------------------------------------
 write-host "Retrieving list of current snowflake roles"
 $currentSnowflakeRoles = snowsql -a $snowflakeAccount -u $snowflakeUser -r $snowflakeRole --region $snowflakeRegion -q 'show roles' -o exit_on_error=true -o output_format=csv -o friendly=false -o timing=false | convertfrom-csv
 
 write-host "Checking membership of current roles"
-
 $showGrantsSqlTemplate=@"
 SHOW GRANTS OF ROLE \"{0}\";`r`n
 "@
@@ -175,7 +210,8 @@ $currentSnowflakeRoles | %{
   $showGrantsSql = $showGrantsSql + ($showGrantsSqlTemplate -f $_.name)
 }
 $currentSnowflakeRoleGrants = snowsql -a $snowflakeAccount -u $snowflakeUser -r $snowflakeRole --region $snowflakeRegion -q $showGrantsSql -o exit_on_error=true -o output_format=csv -o friendly=false -o timing=false | convertfrom-csv
-$currentSnowflakeRoleGrants = $currentSnowflakeRoleGrants | Where-Object {$_.created_on -ne 'created_on'} # multiple record sets returned and flattened to CSV, remove the "header" rows
+# multiple record sets are returned and flattened to CSV, so remove the "header" rows and also ignore nested roles
+$currentSnowflakeRoleGrants = @($currentSnowflakeRoleGrants | Where-Object {$_.created_on -ne 'created_on' -and $_.granted_to -eq 'USER'})
 
 $createRoleSqlTemplate=@"
 CREATE ROLE \"{0}\";`r`n
@@ -189,24 +225,20 @@ $revokeRoleSqlTemplate=@"
 REVOKE ROLE \"{0}\" FROM USER \"{1}\";`r`n
 "@
 
-# ensure that all users, roles and grants defined in AD exist in snowflake
+# -------------------------------------------------------------------------------------
+# For each role mapping defined in AD, grant or alter accordingly in Snowflake
+# -------------------------------------------------------------------------------------
 $roleMappings.Keys | % {
   $roleName = $_
-
-  if ($removeRolePrefix){
-    $roleNameNew = $roleName -replace "^$rolePrefix",""
-    write-host "Removing role prefix from $roleName, yielding $roleNameNew"
-    $roleName = $roleNameNew
-  }
   write-host "Checking role $roleName exists in Snowflake"
   if (($currentSnowflakeRoles | Where-Object {$_.name -eq $roleName}) -eq $null){
     write-host "Role does not exist, creating"
     $sqlStatement = $sqlStatement + ($createRoleSqlTemplate -f $roleName)
   }
   write-host "Checking role $roleName has the appropriate members"
-  $currentRoleGrantees = $currentSnowflakeRoleGrants | Where-Object {$_.role -eq $roleName -and $_.grantee_name -like '*@*'} | %{$_.grantee_name}
-  $missingSnowflakeGrantees = $roleMappings[$roleName] | Where-Object {$_ -ne $null -and $_ -notin $currentRoleGrantees}
-  $superfluousSnowflakeGrantees = $currentRoleGrantees | Where-Object {$_ -ne $null -and $_ -notin $roleMappings[$roleName]}
+  $currentRoleGrantees = @($currentSnowflakeRoleGrants | Where-Object {$_.role -eq $roleName -and $_.grantee_name -notin $currentSnowflakeNonSSOUserNames} | %{$_.grantee_name})
+  $missingSnowflakeGrantees = @($roleMappings[$roleName] | Where-Object {$_ -ne $null -and $_ -notin $currentRoleGrantees})
+  $superfluousSnowflakeGrantees = @($currentRoleGrantees | Where-Object {$_ -ne $null -and $_ -notin $roleMappings[$roleName]})
   write-host "Missing grantees: $missingSnowflakeGrantees"
   write-host "Superfluous grantees: $superfluousSnowflakeGrantees"
   $missingSnowflakeGrantees | %{
@@ -217,7 +249,9 @@ $roleMappings.Keys | % {
   }
 }
 
-
+# -------------------------------------------------------------------------------------
+# Wrap the SQL in a transaction and run (or display to console if -WhatIf specified)
+# -------------------------------------------------------------------------------------
 if ($sqlStatement.Length -gt 0){
   $sqlStatement = "BEGIN TRANSACTION;`r`n{0}COMMIT;" -f $sqlStatement
   If ($WhatIf){
