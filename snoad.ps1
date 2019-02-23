@@ -17,6 +17,9 @@ For each security group immediately within the OU, a role in Snowflake is matche
 Snowflake users are granted it. Any users who have subsequently been removed from the AD group will be revoked
 from the corresponding role.
 
+For any nested security groups, if it matches the rolePrefix then it will be added as a nested role in Snowflake.
+Otherwise, users will be retrieve recursively to grant the original role to.
+
 If disableRemovedUsers is set to $true, any SSO-based Snowflake users (i.e. those without Snowflake passwords)
 will be disabled if they aren't part of any of the AD groups.
 
@@ -126,7 +129,8 @@ write-host "Total current Snowflake SSO users:  $($currentSnowflakeEnabledSSOUse
 # Retrieve security groups from AD
 # -------------------------------------------------------------------------------------
 write-host "Retrieving AD security groups in OU $ouIdentity"
-$roleMappings=@{}
+$roleMappingsUsers=@{}
+$roleMappingsRoles=@{}
 $allGroups=Get-ADGroup -SearchBase $ouIdentity -filter {GroupCategory -eq "Security"}
 $groupsMatchingRolePrefix = $allGroups
 if ($rolePrefix -ne $null){
@@ -137,23 +141,26 @@ if ($rolePrefix -ne $null){
 # -------------------------------------------------------------------------------------
 $groupsMatchingRolePrefix | % {
   $roleName = $_.Name
+  write-host "Fetching users immediately in group $roleName whose accounts aren't disabled"
+  $directUsers = $_ | Get-ADGroupMember | Where-Object {$_.objectClass -eq 'user'} | select samaccountname | %{(Get-ADUser $_.samaccountname -Properties $loginNameADAttribute,Enabled | where-object {$_.($loginNameADAttribute) -ne $null -and $_.Enabled -eq $true}).($loginNameADAttribute)}
+  write-host "Fetching users nested in non-snowflake groups under group $roleName, whose accounts aren't disabled"
+  $nestedUsers = $_ | Get-ADGroupMember | Where-Object {$_.objectClass -eq 'group' -and $_.name -notmatch "^$rolePrefix"} | Get-ADGroupMember -Recursive | select samaccountname | %{(Get-ADUser $_.samaccountname -Properties $loginNameADAttribute,Enabled | where-object {$_.($loginNameADAttribute) -ne $null -and $_.Enabled -eq $true}).($loginNameADAttribute)}
   if ($removeRolePrefix){
     $roleNameNew = $roleName -replace "^$rolePrefix",""
     write-host "Removing role prefix from $roleName, yielding $roleNameNew"
     $roleName = $roleNameNew
   }
-  write-host "Fetching users in group $($_.Name) whose accounts aren't disabled"
-  $roleMappings[$roleName] = $_ | Get-ADGroupMember -Recursive | select samaccountname | %{(Get-ADUser $_.samaccountname -Properties $loginNameADAttribute,Enabled | where-object {$_.($loginNameADAttribute) -ne $null -and $_.Enabled -eq $true}).($loginNameADAttribute)}
+  $roleMappingsUsers[$roleName]=@($directUsers)+@($nestedUsers)
+  write-host "Fetching nested roles in $roleName"
+  $roleMappingsRoles[$roleName] = $_ | Get-ADGroupMember | Where-Object {$_.objectClass -eq 'group' -and ($rolePrefix -eq $null -or $_.name -match "^$rolePrefix")} | %{$_.name -replace "^$rolePrefix",""}
 }
-
 # -------------------------------------------------------------------------------------
 # Work out which users require creating and which require disabling
 # -------------------------------------------------------------------------------------
-$allUsersInRoleMappings=@($roleMappings.Keys |% {$roleMappings[$_]} | Select-Object -Unique | sort)
-write-host "Total users defined in AD roles: $($allUsersInRoleMappings.Length)"
+$allUsersInroleMappingsUsers=$roleMappingsUsers.Keys |% {$roleMappingsUsers[$_]} | Select-Object -Unique | sort
 
-$missingSnowflakeUsers=@($allUsersInRoleMappings | Where-Object {$_ -notin $currentSnowflakeEnabledSSOUserNames})
-$superfluousSnowflakeUsers=@($currentSnowflakeEnabledSSOUserNames | Where-Object {$_ -notin $allUsersInRoleMappings})
+$missingSnowflakeUsers=$allUsersInroleMappingsUsers | Where-Object {$_ -notin $currentSnowflakeEnabledSSOUserNames}
+$superfluousSnowflakeUsers=$currentSnowflakeEnabledSSOUserNames | Where-Object {$_ -notin $allUsersInroleMappingsUsers}
 
 # -------------------------------------------------------------------------------------
 # Add missing users to Snowflake, or re-enabled them if they are disabled
@@ -217,35 +224,77 @@ $createRoleSqlTemplate=@"
 CREATE ROLE \"{0}\";`r`n
 "@
 
-$grantRoleSqlTemplate=@"
+$grantRoleToUserSqlTemplate=@"
 GRANT ROLE \"{0}\" TO USER \"{1}\";`r`n
 "@
 
-$revokeRoleSqlTemplate=@"
+$revokeRoleFromUserSqlTemplate=@"
 REVOKE ROLE \"{0}\" FROM USER \"{1}\";`r`n
+"@
+
+$grantRoleToRoleSqlTemplate=@"
+GRANT ROLE \"{0}\" TO ROLE \"{1}\";`r`n
+"@
+
+$revokeRoleFromRoleSqlTemplate=@"
+REVOKE ROLE \"{0}\" FROM ROLE \"{1}\";`r`n
 "@
 
 # -------------------------------------------------------------------------------------
 # For each role mapping defined in AD, grant or alter accordingly in Snowflake
 # -------------------------------------------------------------------------------------
-$roleMappings.Keys | % {
+# check that all defined roles exist
+$roleMappingsUsers.Keys | % {
   $roleName = $_
   write-host "Checking role $roleName exists in Snowflake"
   if (($currentSnowflakeRoles | Where-Object {$_.name -eq $roleName}) -eq $null){
     write-host "Role does not exist, creating"
     $sqlStatement = $sqlStatement + ($createRoleSqlTemplate -f $roleName)
   }
-  write-host "Checking role $roleName has the appropriate members"
-  $currentRoleGrantees = @($currentSnowflakeRoleGrants | Where-Object {$_.role -eq $roleName -and $_.grantee_name -notin $currentSnowflakeNonSSOUserNames} | %{$_.grantee_name})
-  $missingSnowflakeGrantees = @($roleMappings[$roleName] | Where-Object {$_ -ne $null -and $_ -notin $currentRoleGrantees})
-  $superfluousSnowflakeGrantees = @($currentRoleGrantees | Where-Object {$_ -ne $null -and $_ -notin $roleMappings[$roleName]})
-  write-host "Missing grantees: $missingSnowflakeGrantees"
-  write-host "Superfluous grantees: $superfluousSnowflakeGrantees"
-  $missingSnowflakeGrantees | %{
-    $sqlStatement = $sqlStatement + ($grantRoleSqlTemplate -f $roleName,$_)
+}
+$roleMappingsRoles.Keys | % {
+  $roleName = $_
+  write-host "Checking role $roleName exists in Snowflake"
+  if (($currentSnowflakeRoles | Where-Object {$_.name -eq $roleName}) -eq $null){
+    write-host "Role does not exist, creating"
+    $sqlStatement = $sqlStatement + ($createRoleSqlTemplate -f $roleName)
   }
-  $superfluousSnowflakeGrantees | %{
-    $sqlStatement = $sqlStatement + ($revokeRoleSqlTemplate -f $roleName,$_)
+}
+
+# ensure that all users, roles and grants defined in AD exist in snowflake
+$roleMappingsUsers.Keys | % {
+  $roleName = $_
+  # Don't worry about granting the public role to users, it's automatic
+  if ($roleName -eq 'PUBLIC'){
+    return;
+  }
+  write-host "Checking role $roleName has the appropriate users"
+  $currentRoleGranteeUsers = $currentSnowflakeRoleGrants | Where-Object {$_.role -eq $roleName -and $_.granted_to -eq 'USER' -and $_.grantee_name -like '*@*'} | %{$_.grantee_name}
+  $missingSnowflakeGranteeUsers = $roleMappingsUsers[$roleName] | Where-Object {$_ -ne $null -and $_ -notin $currentRoleGranteeUsers}
+  $superfluousSnowflakeGranteeUsers = $currentRoleGranteeUsers | Where-Object {$_ -ne $null -and $_ -notin $roleMappingsUsers[$roleName]}
+  write-host "missing grantees: $missingSnowflakeGranteeUsers"
+  write-host "superfluous grantees: $superfluousSnowflakeGrantees"
+  $missingSnowflakeGranteeUsers | %{
+    $sqlStatement = $sqlStatement + ($grantRoleToUserSqlTemplate -f $roleName,$_)
+  }
+  $superfluousSnowflakeGranteeUsers | %{
+    $sqlStatement = $sqlStatement + ($revokeRoleFromUserSqlTemplate -f $roleName,$_)
+  }
+}
+
+$roleMappingsRoles.Keys | % {
+  $roleName = $_
+  write-host "Checking role $roleName has the appropriate roles"
+  $currentRoleGranteeRoles = $currentSnowflakeRoleGrants | Where-Object {$_.role -eq $roleName -and $_.granted_to -eq 'ROLE'} | %{$_.grantee_name}
+  $missingSnowflakeGranteeRoles = $roleMappingsRoles[$roleName] | Where-Object {$_ -ne $null -and $_ -notin $currentRoleGranteeRoles}
+  $superfluousSnowflakeGranteeRoles = $currentRoleGranteeRoles | Where-Object {$_ -ne $null -and $_ -notin $roleMappingsRoles[$roleName]}
+  write-host "missing grantees: $missingSnowflakeGranteeRoles"
+  write-host "superfluous grantees: $superfluousSnowflakeGranteeRoles"
+  $missingSnowflakeGranteeRoles | %{
+    $sqlStatement = $sqlStatement + ($grantRoleToRoleSqlTemplate -f $roleName,$_)
+  }
+  $superfluousSnowflakeGranteeRoles | %{
+    $sqlStatement = $sqlStatement + ($revokeRoleFromRoleSqlTemplate -f $roleName,$_)
   }
 }
 
