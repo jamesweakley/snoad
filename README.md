@@ -14,6 +14,8 @@ must be ran on a domain-connected Windows machine.
 
 The list of all possible users is checked against Snowflake to ensure they all exist. If any are missing, they are either created or an error is raised, depending on the value of the createAnyMissingUsers parameter.
 
+_Note: Passwords are of course not replicated into Snowflake. Aside from this being a bad idea, there's no way to retrieve a password from AD, so you need a Single Sign On mechanism like Okta_
+
 For each security group immediately within the OU, a role in Snowflake is matched or created and all Snowflake users are granted it according to their membership in the AD security group. Any users who have subsequently been removed from the AD group will be revoked from the corresponding role.
 
 If disableRemovedUsers is set to $true, any SSO-based Snowflake users (i.e. those without Snowflake passwords) will be disabled if they aren't part of any of the AD groups.
